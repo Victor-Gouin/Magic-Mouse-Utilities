@@ -23,6 +23,7 @@ DefaultGroupName={#AppName}
 AllowNoIcons=yes
 OutputDir=output
 OutputBaseFilename=MagicMouseStudio-Setup-{#AppVersion}
+SetupIconFile=..\assets\icon.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

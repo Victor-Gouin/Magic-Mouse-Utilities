@@ -167,7 +167,9 @@ pub fn run_tray_loop(
 
         let _ = TRAY_HWND.set(hwnd.0 as isize);
 
-        let hicon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        let hicon = LoadIconW(hinstance, PCWSTR(1usize as *const u16))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default();
 
         let nid = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,

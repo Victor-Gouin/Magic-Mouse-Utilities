@@ -51,6 +51,7 @@ pub struct MagicMouseGuiApp {
     demo_click: bool,
     last_frame: Instant,
     status_toast: Option<(String, Instant)>,
+    logo_texture: egui::TextureHandle,
 }
 
 impl MagicMouseGuiApp {
@@ -67,6 +68,13 @@ impl MagicMouseGuiApp {
         register_egui_context(cc.egui_ctx.clone());
 
         let is_connected = status.read().map(|s| s.is_some()).unwrap_or(false);
+        let logo_image = egui::ColorImage::from_rgba_unmultiplied(
+            [64, 64],
+            include_bytes!("../assets/icon_64.rgba"),
+        );
+        let logo_texture =
+            cc.egui_ctx
+                .load_texture("app_logo", logo_image, egui::TextureOptions::LINEAR);
 
         Self {
             running,
@@ -83,6 +91,7 @@ impl MagicMouseGuiApp {
             demo_click: false,
             last_frame: Instant::now(),
             status_toast: None,
+            logo_texture,
         }
     }
 
@@ -540,6 +549,8 @@ impl eframe::App for MagicMouseGuiApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
+                    ui.image((self.logo_texture.id(), Vec2::splat(34.0)));
+                    ui.add_space(6.0);
                     ui.vertical(|ui| {
                         ui.add_space(10.0);
                         ui.label(
@@ -1063,9 +1074,16 @@ pub fn run_gui(
     driver_state: SharedDriverState,
     start_hidden: bool,
 ) -> eframe::Result<()> {
+    let window_icon = egui::IconData {
+        rgba: include_bytes!("../assets/icon_64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Magic Mouse Studio")
+            .with_icon(Arc::new(window_icon))
             .with_inner_size([860.0, 620.0])
             .with_min_inner_size([760.0, 520.0])
             .with_visible(!start_hidden),

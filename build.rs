@@ -135,8 +135,44 @@ fn build_vs_version_info() -> Vec<u8> {
     root
 }
 
-/// Génère un fichier objet COFF 64 bits (`.o`) contenant la ressource `RT_VERSION` (16) et
-/// le manifeste d'application UAC `asInvoker` `RT_MANIFEST` (24) sans nécessiter `windres.exe`.
+/// Parse `assets/icon.ico` et retourne `(RT_ICON entries, RT_GROUP_ICON blob)` pour les ressources PE.
+fn parse_ico_resources(ico_bytes: &[u8]) -> Option<(Vec<(u32, Vec<u8>)>, Vec<u8>)> {
+    if ico_bytes.len() < 6 {
+        return None;
+    }
+    let reserved = u16::from_le_bytes([ico_bytes[0], ico_bytes[1]]);
+    let ico_type = u16::from_le_bytes([ico_bytes[2], ico_bytes[3]]);
+    let count = u16::from_le_bytes([ico_bytes[4], ico_bytes[5]]) as usize;
+    if reserved != 0 || ico_type != 1 || count == 0 || ico_bytes.len() < 6 + count * 16 {
+        return None;
+    }
+
+    let mut icons = Vec::with_capacity(count);
+    let mut grp = Vec::with_capacity(6 + count * 14);
+    grp.extend_from_slice(&ico_bytes[0..6]);
+
+    for i in 0..count {
+        let off = 6 + i * 16;
+        let entry = &ico_bytes[off..off + 16];
+        let bytes_in_res =
+            u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+        let image_offset =
+            u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+        let end = image_offset.checked_add(bytes_in_res)?;
+        if end > ico_bytes.len() {
+            return None;
+        }
+        let icon_id = (i + 1) as u32;
+        icons.push((icon_id, ico_bytes[image_offset..end].to_vec()));
+        grp.extend_from_slice(&entry[0..12]);
+        grp.extend_from_slice(&(icon_id as u16).to_le_bytes());
+    }
+
+    Some((icons, grp))
+}
+
+/// Génère un fichier objet COFF 64 bits (`.o`) contenant l'icône (`RT_ICON` 3 + `RT_GROUP_ICON` 14),
+/// la ressource `RT_VERSION` (16) et le manifeste UAC `asInvoker` `RT_MANIFEST` (24) sans `windres.exe`.
 fn write_pe_resource_coff(path: &PathBuf) {
     let version_blob = build_vs_version_info();
     let manifest_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -158,91 +194,123 @@ fn write_pe_resource_coff(path: &PathBuf) {
   </compatibility>
 </assembly>"#;
 
-    // Section .rsrc$02 : données brutes alignées sur 8 octets
-    let mut rsrc02 = Vec::new();
-    let ver_offset_in_02 = 0u32;
-    let ver_size = version_blob.len() as u32;
-    rsrc02.extend_from_slice(&version_blob);
-    while rsrc02.len() % 8 != 0 {
-        rsrc02.push(0);
+    // Collecte des ressources (type_id, name_id, lang_id, data)
+    let mut raw_entries: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
+    if let Ok(ico_bytes) = fs::read("assets/icon.ico") {
+        if let Some((icons, grp)) = parse_ico_resources(&ico_bytes) {
+            for (icon_id, data) in icons {
+                raw_entries.push((3, icon_id, 1033, data)); // RT_ICON = 3
+            }
+            raw_entries.push((14, 1, 1033, grp)); // RT_GROUP_ICON = 14
+        }
     }
-    let man_offset_in_02 = rsrc02.len() as u32;
-    let man_size = manifest_xml.len() as u32;
-    rsrc02.extend_from_slice(manifest_xml);
-    while rsrc02.len() % 8 != 0 {
-        rsrc02.push(0);
+    raw_entries.push((16, 1, 1033, version_blob)); // RT_VERSION = 16
+    raw_entries.push((24, 1, 1033, manifest_xml.to_vec())); // RT_MANIFEST = 24
+    raw_entries.sort_by_key(|(t, n, l, _)| (*t, *n, *l));
+
+    // Regroupement hiérarchique Type -> Name -> Lang
+    let mut tree: Vec<(u32, Vec<(u32, Vec<(u32, Vec<u8>)>)>)> = Vec::new();
+    for (t, n, l, data) in raw_entries {
+        if tree.last().map(|x| x.0) != Some(t) {
+            tree.push((t, Vec::new()));
+        }
+        let names = &mut tree.last_mut().unwrap().1;
+        if names.last().map(|x| x.0) != Some(n) {
+            names.push((n, Vec::new()));
+        }
+        names.last_mut().unwrap().1.push((l, data));
     }
 
-    // Section .rsrc$01 : arbre de répertoires de ressources + 2 IMAGE_RESOURCE_DATA_ENTRY
-    // Layout de .rsrc$01 (total = 176 octets) :
-    // [0..16]    Root Directory (2 entries)
-    // [16..24]   Entry 0: Type 16 (RT_VERSION) -> subdir @ 0x20 (32)
-    // [24..32]   Entry 1: Type 24 (RT_MANIFEST) -> subdir @ 0x38 (56)
-    // [32..48]   Type 16 Subdir (1 entry)
-    // [48..56]   Entry: ID 1 -> subdir @ 0x50 (80)
-    // [56..72]   Type 24 Subdir (1 entry)
-    // [72..80]   Entry: ID 1 -> subdir @ 0x68 (104)
-    // [80..96]   Type 16 ID 1 Lang Subdir (1 entry)
-    // [96..104]  Entry: Lang 1033 -> DataEntry @ 0x80 (128)
-    // [104..120] Type 24 ID 1 Lang Subdir (1 entry)
-    // [120..128] Entry: Lang 1033 -> DataEntry @ 0x90 (144)
-    // [128..144] DataEntry 0 (Version): OffsetToData @ 128, Size = ver_size
-    // [144..160] DataEntry 1 (Manifest): OffsetToData @ 144, Size = man_size
-    let mut rsrc01 = Vec::new();
-    let push_dir = |b: &mut Vec<u8>, id_count: u16| {
+    // Calcul des offsets dans .rsrc$01
+    let root_dir_size = 16 + 8 * tree.len();
+    let mut type_dirs_size = 0usize;
+    let mut lang_dirs_size = 0usize;
+    let mut leaf_count = 0usize;
+    for (_, names) in &tree {
+        type_dirs_size += 16 + 8 * names.len();
+        for (_, langs) in names {
+            lang_dirs_size += 16 + 8 * langs.len();
+            leaf_count += langs.len();
+        }
+    }
+    let _total_rsrc01_size = root_dir_size + type_dirs_size + lang_dirs_size + leaf_count * 16;
+
+    let push_dir = |b: &mut Vec<u8>, id_count: usize| {
         b.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
         b.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
         b.extend_from_slice(&0u16.to_le_bytes()); // MajorVersion
         b.extend_from_slice(&0u16.to_le_bytes()); // MinorVersion
         b.extend_from_slice(&0u16.to_le_bytes()); // NumberOfNamedEntries
-        b.extend_from_slice(&id_count.to_le_bytes()); // NumberOfIdEntries
+        b.extend_from_slice(&(id_count as u16).to_le_bytes()); // NumberOfIdEntries
     };
     let push_entry = |b: &mut Vec<u8>, id: u32, offset: u32, is_dir: bool| {
         b.extend_from_slice(&id.to_le_bytes());
-        let off = if is_dir {
-            offset | 0x8000_0000
-        } else {
-            offset
-        };
+        let off = if is_dir { offset | 0x8000_0000 } else { offset };
         b.extend_from_slice(&off.to_le_bytes());
     };
 
-    // Root [0..32]
-    push_dir(&mut rsrc01, 2);
-    push_entry(&mut rsrc01, 16, 32, true); // RT_VERSION -> 32
-    push_entry(&mut rsrc01, 24, 56, true); // RT_MANIFEST -> 56
-    // Type 16 Subdir [32..56]
-    push_dir(&mut rsrc01, 1);
-    push_entry(&mut rsrc01, 1, 80, true); // ID 1 -> 80
-    // Type 24 Subdir [56..80]
-    push_dir(&mut rsrc01, 1);
-    push_entry(&mut rsrc01, 1, 104, true); // ID 1 -> 104
-    // Type 16 Lang Subdir [80..104]
-    push_dir(&mut rsrc01, 1);
-    push_entry(&mut rsrc01, 1033, 128, false); // Lang 1033 -> DataEntry @ 128
-    // Type 24 Lang Subdir [104..128]
-    push_dir(&mut rsrc01, 1);
-    push_entry(&mut rsrc01, 1033, 144, false); // Lang 1033 -> DataEntry @ 144
+    let mut rsrc01 = Vec::with_capacity(_total_rsrc01_size);
+    let mut rsrc02 = Vec::new();
+    let mut reloc_rvas: Vec<u32> = Vec::with_capacity(leaf_count);
 
-    // DataEntry 0 @ 128 (Version)
-    rsrc01.extend_from_slice(&ver_offset_in_02.to_le_bytes()); // OffsetToData (relocated to .rsrc$02)
-    rsrc01.extend_from_slice(&ver_size.to_le_bytes());
-    rsrc01.extend_from_slice(&0u32.to_le_bytes()); // CodePage
-    rsrc01.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    // 1. Root Directory
+    push_dir(&mut rsrc01, tree.len());
+    let mut cur_type_off = root_dir_size as u32;
+    for (type_id, names) in &tree {
+        push_entry(&mut rsrc01, *type_id, cur_type_off, true);
+        cur_type_off += (16 + 8 * names.len()) as u32;
+    }
 
-    // DataEntry 1 @ 144 (Manifest)
-    rsrc01.extend_from_slice(&man_offset_in_02.to_le_bytes()); // OffsetToData (relocated to .rsrc$02)
-    rsrc01.extend_from_slice(&man_size.to_le_bytes());
-    rsrc01.extend_from_slice(&0u32.to_le_bytes()); // CodePage
-    rsrc01.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    // 2. Type Subdirectories
+    let mut cur_lang_off = (root_dir_size + type_dirs_size) as u32;
+    for (_, names) in &tree {
+        push_dir(&mut rsrc01, names.len());
+        for (name_id, langs) in names {
+            push_entry(&mut rsrc01, *name_id, cur_lang_off, true);
+            cur_lang_off += (16 + 8 * langs.len()) as u32;
+        }
+    }
+
+    // 3. Lang Subdirectories
+    let mut cur_data_entry_off = (root_dir_size + type_dirs_size + lang_dirs_size) as u32;
+    for (_, names) in &tree {
+        for (_, langs) in names {
+            push_dir(&mut rsrc01, langs.len());
+            for (lang_id, _) in langs {
+                push_entry(&mut rsrc01, *lang_id, cur_data_entry_off, false);
+                cur_data_entry_off += 16;
+            }
+        }
+    }
+
+    // 4. IMAGE_RESOURCE_DATA_ENTRY leaves + .rsrc$02 payloads
+    for (_, names) in &tree {
+        for (_, langs) in names {
+            for (_, data) in langs {
+                let data_offset_in_02 = rsrc02.len() as u32;
+                let data_size = data.len() as u32;
+                rsrc02.extend_from_slice(data);
+                while rsrc02.len() % 8 != 0 {
+                    rsrc02.push(0);
+                }
+
+                let entry_rva = rsrc01.len() as u32;
+                reloc_rvas.push(entry_rva);
+                rsrc01.extend_from_slice(&data_offset_in_02.to_le_bytes()); // OffsetToData (relocated)
+                rsrc01.extend_from_slice(&data_size.to_le_bytes());
+                rsrc01.extend_from_slice(&0u32.to_le_bytes()); // CodePage
+                rsrc01.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+            }
+        }
+    }
 
     // Assemblage du fichier COFF x86_64
     // Header COFF (20 octets) + 2 Section Headers (2 * 40 = 80 octets) = 100 octets
     let sec1_raw_ptr = 100u32;
-    let sec1_size = rsrc01.len() as u32; // 160
-    let sec1_reloc_ptr = sec1_raw_ptr + sec1_size; // 260
-    let sec1_reloc_count = 2u16; // 2 * 10 = 20 octets
-    let sec2_raw_ptr = sec1_reloc_ptr + 20; // 280
+    let sec1_size = rsrc01.len() as u32;
+    let sec1_reloc_ptr = sec1_raw_ptr + sec1_size;
+    let sec1_reloc_count = reloc_rvas.len() as u16;
+    let sec2_raw_ptr = sec1_reloc_ptr + (reloc_rvas.len() as u32) * 10;
     let sec2_size = rsrc02.len() as u32;
     let symtab_ptr = sec2_raw_ptr + sec2_size;
     let num_symbols = 1u32; // Symbole 0 : ".rsrc$02" (Section 2)
@@ -286,8 +354,8 @@ fn write_pe_resource_coff(path: &PathBuf) {
     // 4. Données de .rsrc$01
     coff.extend_from_slice(&rsrc01);
 
-    // 5. 2 Relocations pour .rsrc$01 (IMAGE_REL_AMD64_ADDR32NB = 0x0003 vers symbole 0)
-    for rva_off in [128u32, 144u32] {
+    // 5. Relocations pour .rsrc$01 (IMAGE_REL_AMD64_ADDR32NB = 0x0003 vers symbole 0)
+    for rva_off in reloc_rvas {
         coff.extend_from_slice(&rva_off.to_le_bytes()); // VirtualAddress
         coff.extend_from_slice(&0u32.to_le_bytes()); // SymbolTableIndex = 0
         coff.extend_from_slice(&0x0003u16.to_le_bytes()); // Type = IMAGE_REL_AMD64_ADDR32NB
@@ -311,6 +379,7 @@ fn write_pe_resource_coff(path: &PathBuf) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/icon.ico");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rustc-link-search=native={}", out_dir.display());
 
