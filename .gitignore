@@ -4,6 +4,9 @@
 *.pdb
 *.exe
 
+# Installer build output
+/installer/output/
+
 # Runtime config generated next to executable
 magic-mouse-config.json
 
