@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+
+# Runtime config generated next to executable
+magic-mouse-config.json
+
+# Private signing keys (keep public .cer only)
+*.pfx
+*.p12
+*.key
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
